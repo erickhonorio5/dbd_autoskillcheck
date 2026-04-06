@@ -5,6 +5,7 @@ import onnxruntime as ort
 import atexit
 import sys
 from pyautogui import size as pyautogui_size
+from collections import deque
 
 try:
     import torch
@@ -13,17 +14,27 @@ except ImportError as e:
     print(e)
 
 
+# Cache monitor attributes globally for better performance
+_MONITOR_CACHE = None
+
 def get_monitor_attributes():
+    """Get monitor attributes with caching for better performance."""
+    global _MONITOR_CACHE
+    
+    if _MONITOR_CACHE is not None:
+        return _MONITOR_CACHE
+    
     width, height = pyautogui_size()
-    object_size_h_ratio = 224 / 1080
+    object_size_h_ratio = 224 / 1080  # Modelo espera 224x224
     object_size = int(object_size_h_ratio * height)
 
-    return {
+    _MONITOR_CACHE = {
         "top": height // 2 - object_size // 2,
         "left": width // 2 - object_size // 2,
         "width": object_size,
         "height": object_size
     }
+    return _MONITOR_CACHE
 
 class AI_model:
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -49,9 +60,18 @@ class AI_model:
         self.nb_cpu_threads = nb_cpu_threads
         self.mss = mss()
         self.monitor = get_monitor_attributes()
-
+        self.crop_size = 224  # Modelo espera 224x224
+        
         self.context = None
         self.engine = None
+        
+        # Pre-allocate arrays for faster processing
+        self.prealloc_array = None
+        self._logits_buffer = None
+        
+        # Sistema de validação de predições consecutivas para evitar falsos positivos
+        self.prediction_history = deque(maxlen=2)  # Histórico reduzido para responsividade
+        self.last_valid_pred = 0
 
         if model_path.endswith(".engine"):
             assert self.use_gpu, "TensorRT engine model requires GPU mode"
@@ -70,26 +90,50 @@ class AI_model:
             torch.cuda.empty_cache()
 
     def grab_screenshot(self):
+        """Captura screenshot otimizada."""
         return self.mss.grab(self.monitor)
 
     def screenshot_to_pil(self, screenshot):
+        """Converte screenshot para PIL com otimizações de performance."""
+        # Conversão otimizada diretamente para RGB
         pil_image = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-        if pil_image.width != 224 or pil_image.height != 224:
-            pil_image = pil_image.resize((224, 224), Image.Resampling.LANCZOS)
+        
+        # Resize apenas se necessário, usando BILINEAR (mais rápido)
+        if pil_image.width != self.crop_size or pil_image.height != self.crop_size:
+            pil_image = pil_image.resize((self.crop_size, self.crop_size), Image.Resampling.BILINEAR)
+        
         return pil_image
 
     def pil_to_numpy(self, image_pil):
-        img = np.asarray(image_pil, dtype=np.float32) / 255.0
+        """Converte PIL para numpy com performance otimizada e buffers pré-alocados."""
+        # Pre-allocate arrays for faster processing if not already done
+        if self.prealloc_array is None or self.prealloc_array.shape[2:] != (self.crop_size, self.crop_size):
+            self.prealloc_array = np.zeros((1, 3, self.crop_size, self.crop_size), dtype=np.float32)
+        
+        # Conversão otimizada usando numpy array direto
+        img = np.asarray(image_pil, dtype=np.float32, order='C') / 255.0
+        
+        # Transposição otimizada (HWC para CHW) e normalização
         img = np.transpose(img, (2, 0, 1))
         img = (img - self.MEAN[:, None, None]) / self.STD[:, None, None]
-        return np.expand_dims(img, axis=0)
+        
+        self.prealloc_array[0] = img
+        
+        return self.prealloc_array
 
     def softmax(self, x):
-        exp_x = np.exp(x - np.max(x))
-        return exp_x / np.sum(exp_x)
+        x_max = np.max(x)
+        exp_x = np.exp(x - x_max)
+        sum_exp = np.sum(exp_x)
+        return exp_x / sum_exp
 
     def load_onnx(self):
         sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess_options.enable_mem_pattern = True
+        sess_options.enable_cpu_mem_arena = True
+        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        sess_options.optimized_model_filepath = self.model_path + ".optimized"
 
         if not self.use_gpu and self.nb_cpu_threads is not None:
             sess_options.intra_op_num_threads = self.nb_cpu_threads
@@ -151,13 +195,23 @@ class AI_model:
 
         return inputs, outputs, bindings
 
-    def predict(self, image):
+    def predict(self, image, confidence_threshold=0.65, require_consecutive=1):
+        """
+        Predição otimizada com validação de predições consecutivas.
+        
+        Args:
+            image: Imagem PIL ou numpy array
+            confidence_threshold: Limiar de confiança mínimo (0.65-0.75 recomendado para responsividade)
+            require_consecutive: Número de predições consecutivas necessárias (1=rápido, 2=conservador)
+        """
         if isinstance(image, np.ndarray):
             img_np = image
         else:
             img_np = self.pil_to_numpy(image)
-
-        img_np = np.ascontiguousarray(img_np)
+            
+        # Pre-allocate memory for results if needed
+        if self._logits_buffer is None:
+            self._logits_buffer = np.zeros((len(self.pred_dict),), dtype=np.float32)
 
         if self.is_tensorrt:
             torch.cuda.synchronize()
@@ -186,12 +240,37 @@ class AI_model:
 
             ort_inputs = {self.input_name: img_np}
             logits = np.squeeze(self.ort_session.run(None, ort_inputs))
+            
+            # Use buffer pré-alocado para resultados
+            np.copyto(self._logits_buffer, logits)
+            logits = self._logits_buffer
 
         pred = int(np.argmax(logits))
         probs = self.softmax(logits)
         probs_dict = {self.pred_dict[i]["desc"]: probs[i] for i in range(len(probs))}
-
-        return pred, self.pred_dict[pred]["desc"], probs_dict, self.pred_dict[pred]["hit"]
+        
+        # Get confidence of predicted class
+        confidence = probs[pred]
+        
+        # Adicionar predição ao histórico
+        self.prediction_history.append((pred, confidence))
+        
+        # Sistema de validação de predições consecutivas
+        should_hit = False
+        
+        if pred != 0 and confidence >= confidence_threshold:
+            # Verificar se temos predições consecutivas similares
+            if len(self.prediction_history) >= require_consecutive:
+                recent_preds = [p[0] for p in list(self.prediction_history)[-require_consecutive:]]
+                recent_confs = [p[1] for p in list(self.prediction_history)[-require_consecutive:]]
+                
+                # Todas as predições recentes devem ser iguais E acima do threshold
+                if (all(p == pred for p in recent_preds) and 
+                    all(c >= confidence_threshold for c in recent_confs)):
+                    should_hit = self.pred_dict[pred]["hit"]
+                    self.last_valid_pred = pred
+        
+        return pred, self.pred_dict[pred]["desc"], probs_dict, should_hit, confidence
 
     def check_provider(self):
         return "TensorRT" if self.is_tensorrt else self.ort_session.get_providers()[0]
