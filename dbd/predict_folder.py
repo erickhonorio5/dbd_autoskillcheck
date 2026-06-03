@@ -42,7 +42,7 @@ def infer_from_folder_onnx(folder):
     # dataloader (to automatically batch images and make the necessary image transformations)
     test_transforms = get_validation_transforms()
     dataset = DBD_dataset(images, test_transforms)
-    dataloader = dataset.get_dataloader(batch_size=1, num_workers=8)
+    dataloader = dataset.get_dataloader(batch_size=64, num_workers=8)
 
     # Model
     filepath = "model.onnx"
@@ -54,8 +54,8 @@ def infer_from_folder_onnx(folder):
         img = batch[0].cpu().numpy()
         ort_inputs = {input_name: img}
         ort_outs = ort_session.run(None, ort_inputs)
-        pred = np.argmax(np.squeeze(ort_outs, 0))
-        results.append(pred)
+        preds = np.argmax(np.squeeze(ort_outs, 0), axis=-1)
+        results.extend(preds.tolist())
 
     results = np.stack([images[:, 0], results], axis=-1)
     return results
@@ -69,13 +69,8 @@ if __name__ == '__main__':
     # preds = infer_from_folder(dataset_source, checkpoint)
     preds = infer_from_folder_onnx(dataset_source)
 
-    os.makedirs(os.path.join(dataset_source, "0"), exist_ok=True)
-    os.makedirs(os.path.join(dataset_source, "1"), exist_ok=True)
-    os.makedirs(os.path.join(dataset_source, "2"), exist_ok=True)
-    os.makedirs(os.path.join(dataset_source, "3"), exist_ok=True)
-    os.makedirs(os.path.join(dataset_source, "4"), exist_ok=True)
-    os.makedirs(os.path.join(dataset_source, "5"), exist_ok=True)
-    os.makedirs(os.path.join(dataset_source, "6"), exist_ok=True)
+    for i in range(7):
+        os.makedirs(os.path.join(dataset_source, str(i)), exist_ok=True)
 
     for image, pred in tqdm.tqdm(preds, desc="Moving images"):
         pred = int(pred)

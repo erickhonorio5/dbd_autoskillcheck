@@ -1,8 +1,23 @@
 import os
+import ctypes
+import threading
 from pathlib import Path
 from time import time, sleep
 from dbd.AI_model import AI_model
 from dbd.utils.directkeys import PressKey, ReleaseKey, SPACE
+
+# Windows timer resolution: default is ~15ms, this sets it to ~1ms.
+# Critical for hit_ante precision — without this, a 25ms sleep can fire anywhere between 10-40ms.
+_winmm = ctypes.WinDLL('winmm')
+
+
+def _perform_hit(delay_ms: float):
+    """Executa o key press em background para não bloquear o loop principal durante o delay."""
+    if delay_ms > 0:
+        sleep(delay_ms / 1000.0)
+    PressKey(SPACE)
+    sleep(0.005)
+    ReleaseKey(SPACE)
 
 from gradio import (
     Dropdown, Radio, Number, Image, Label, Button, Slider,
@@ -74,75 +89,67 @@ def monitor(ai_model_path, device, debug_option, hit_ante, cpu_stress, confidenc
     nb_frames = 0
     nb_hits = 0
     last_hit_time = 0
-    
+    MIN_HIT_DELAY = 0.3
+
     # Controle de FPS baseado na configuração de CPU
     frame_time = 1.0 / target_fps
     last_fps_update = time()
 
-    while True:
-        frame_start = time()
-            
-        screenshot = ai_model.grab_screenshot()
-        image_pil = ai_model.screenshot_to_pil(screenshot)
-        image_np = ai_model.pil_to_numpy(image_pil)
-        nb_frames += 1
+    # Aumenta resolução do timer do Windows: 15ms → ~1ms
+    # Sem isso, hit_ante=25ms pode variar entre 10-40ms na prática
+    _winmm.timeBeginPeriod(1)
+    try:
+        while True:
+            frame_start = time()
 
-        # Predição otimizada - apenas 1 validação para responsividade
-        pred, desc, probs, should_hit, confidence = ai_model.predict(
-            image_np, 
-            confidence_threshold,
-            require_consecutive=1  # Resposta rápida, confiança no threshold
-        )
+            screenshot = ai_model.grab_screenshot()
+            image_pil = ai_model.screenshot_to_pil(screenshot)
+            image_np = ai_model.pil_to_numpy(image_pil)
+            nb_frames += 1
 
-        if pred != 0 and debug_option == debug_options[3]:
-            path = os.path.join(debug_folder, str(pred), "{}.png".format(nb_hits))
-            image_pil.save(path)
-            nb_hits += 1
+            # Predição simples e rápida
+            pred, desc, probs, should_hit, confidence = ai_model.predict(
+                image_np,
+                confidence_threshold,
+                require_consecutive=1
+            )
 
-        current_time = time()
-        # Delay mínimo entre hits - reduzido para responsividade
-        MIN_HIT_DELAY = 0.3  # Timing ideal para skill checks
-        
-        if should_hit and (current_time - last_hit_time) > MIN_HIT_DELAY:
-            # ante-frontier hit delay
-            if pred == 2 and hit_ante > 0:
-                sleep(hit_ante * 0.001)
+            current_time = time()
 
-            PressKey(SPACE)
-            sleep(0.005)  # Delay ultra-rápido
-            ReleaseKey(SPACE)
-            last_hit_time = current_time
-
-            # Mostrar apenas as probabilidades sem adicionar Confidence
-            yield skip(), image_pil, probs
-
-            if debug_option == debug_options[2]:
-                path = os.path.join(debug_folder, str(pred), "hit_{}.png".format(nb_hits))
+            if pred != 0 and debug_option == debug_options[3]:
+                path = os.path.join(debug_folder, str(pred), "{}.png".format(nb_hits))
                 image_pil.save(path)
                 nb_hits += 1
 
-            last_fps_update = time()
-            nb_frames = 0
-            continue
+            if should_hit and (current_time - last_hit_time) > MIN_HIT_DELAY:
+                delay_ms = hit_ante if pred in (2, 9) else 0
+                last_hit_time = current_time
 
-        # Compute fps - atualiza a cada 0.5s para responsividade
-        current_time = time()
-        t_diff = current_time - last_fps_update
-        if t_diff > 0.5:
-            fps = round(nb_frames / t_diff, 1)
+                # Key press em thread separada: loop principal não bloqueia durante o delay
+                threading.Thread(target=_perform_hit, args=(delay_ms,), daemon=True).start()
 
-            # Sempre mostra a imagem capturada para confirmação visual
-            yield fps, image_pil, skip()
+                if debug_option == debug_options[2]:
+                    path = os.path.join(debug_folder, str(pred), "hit_{}.png".format(nb_hits))
+                    image_pil.save(path)
+                    nb_hits += 1
 
-            last_fps_update = current_time
-            nb_frames = 0
-        
-        # Controle de FPS - sleep ultra-mínimo para máxima responsividade
-        frame_elapsed = time() - frame_start
-        sleep_time = frame_time - frame_elapsed
-        if sleep_time > 0.001:
-            sleep(sleep_time)
-        # Sem sleep se já passou do tempo - prioriza responsividade
+                yield skip(), image_pil, probs
+                continue
+
+            # Compute fps - atualiza a cada 0.5s para responsividade
+            t_diff = current_time - last_fps_update
+            if t_diff > 0.5:
+                fps = round(nb_frames / t_diff, 1)
+                yield fps, image_pil, skip()
+                last_fps_update = current_time
+                nb_frames = 0
+
+            # Controle de FPS - sleep ultra-mínimo para máxima responsividade
+            sleep_time = frame_time - (current_time - frame_start)
+            if sleep_time > 0.001:
+                sleep(sleep_time)
+    finally:
+        _winmm.timeEndPeriod(1)
 
 
 if __name__ == "__main__":
@@ -180,11 +187,15 @@ if __name__ == "__main__":
                     debug_option = Dropdown(choices=debug_options, value=debug_options[0], label="Debugging selection")
                 with Column(variant="panel"):
                     Markdown("Features options")
-                    hit_ante = Slider(minimum=0, maximum=50, step=5, value=15, label="Ante-frontier hit delay in ms (ajuste fino: 10-20ms)")
+                    hit_ante = Slider(
+                        minimum=0, maximum=100, step=5, value=25,
+                        label="Ante-frontier delay (ms)",
+                        info="Delay ao detectar ante-frontier para acertar na zona perfeita (teste: 20-35ms)"
+                    )
                     confidence_threshold = Slider(
                         minimum=0.50, maximum=0.95, step=0.05, value=0.65,
-                        label="Confidence Threshold (higher = less false clicks, but may miss some)",
-                        info="Mínimo de confiança para clicar (recomendado: 0.65-0.75 para responsividade)"
+                        label="Confidence Threshold",
+                        info="Confiança mínima para detectar skill check (padrão: 0.65)"
                     )
                     cpu_stress = Radio(
                         label="CPU Performance Mode",

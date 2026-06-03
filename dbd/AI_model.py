@@ -4,8 +4,13 @@ from mss import mss
 import onnxruntime as ort
 import atexit
 import sys
+import threading
+from time import time
 from pyautogui import size as pyautogui_size
 from collections import deque
+
+# MSS uses threading.local() internally — one instance per thread required
+_mss_local = threading.local()
 
 try:
     import torch
@@ -39,18 +44,21 @@ def get_monitor_attributes():
 class AI_model:
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    # Opening animation is ~2-3 frames (33-50ms at 60fps). 50ms covers it without eating into the hit zone.
+    # 120ms was too long — it suppressed the entire hit zone on fast/perk-triggered skill checks.
+    _ENTRY_COOLDOWN = 0.05
 
     pred_dict = {
         0: {"desc": "None", "hit": False},
         1: {"desc": "repair-heal (great)", "hit": True},
-        2: {"desc": "repair-heal (ante-frontier)", "hit": True},
+        2: {"desc": "repair-heal (ante-frontier)", "hit": True},  # Aperta com delay ajustável
         3: {"desc": "repair-heal (out)", "hit": False},
         4: {"desc": "full white (great)", "hit": True},
         5: {"desc": "full white (out)", "hit": False},
         6: {"desc": "full black (great)", "hit": True},
         7: {"desc": "full black (out)", "hit": False},
         8: {"desc": "wiggle (great)", "hit": True},
-        9: {"desc": "wiggle (frontier)", "hit": False},
+        9: {"desc": "wiggle (frontier)", "hit": True},   # fires with ante-frontier delay, same as class 2
         10: {"desc": "wiggle (out)", "hit": False}
     }
 
@@ -58,7 +66,6 @@ class AI_model:
         self.model_path = model_path
         self.use_gpu = use_gpu
         self.nb_cpu_threads = nb_cpu_threads
-        self.mss = mss()
         self.monitor = get_monitor_attributes()
         self.crop_size = 224  # Modelo espera 224x224
         
@@ -69,9 +76,13 @@ class AI_model:
         self.prealloc_array = None
         self._logits_buffer = None
         
-        # Sistema de validação de predições consecutivas para evitar falsos positivos
-        self.prediction_history = deque(maxlen=2)  # Histórico reduzido para responsividade
+        # Sistema de validação simples - lógica original que funcionava
+        self.prediction_history = deque(maxlen=2)
         self.last_valid_pred = 0
+
+        # Entry cooldown: evita hits falsos durante a animação de abertura do círculo
+        self._consecutive_none = 0   # frames consecutivos com pred==0
+        self._skill_check_start_time = None
 
         if model_path.endswith(".engine"):
             assert self.use_gpu, "TensorRT engine model requires GPU mode"
@@ -84,14 +95,15 @@ class AI_model:
         atexit.register(self.cleanup)
 
     def cleanup(self):
-        if self.is_tensorrt:
+        if getattr(self, 'is_tensorrt', False):
             del self.context
             del self.engine
             torch.cuda.empty_cache()
 
     def grab_screenshot(self):
-        """Captura screenshot otimizada."""
-        return self.mss.grab(self.monitor)
+        if not hasattr(_mss_local, 'sct'):
+            _mss_local.sct = mss()
+        return _mss_local.sct.grab(self.monitor)
 
     def screenshot_to_pil(self, screenshot):
         """Converte screenshot para PIL com otimizações de performance."""
@@ -238,9 +250,13 @@ class AI_model:
             elif self.input_dtype == "tensor(float16)":
                 img_np = img_np.astype(np.float16)
 
+            # Only convert dtype when necessary — prealloc_array is already float32
+            if self.input_dtype == "tensor(float16)":
+                img_np = img_np.astype(np.float16)
+
             ort_inputs = {self.input_name: img_np}
             logits = np.squeeze(self.ort_session.run(None, ort_inputs))
-            
+
             # Use buffer pré-alocado para resultados
             np.copyto(self._logits_buffer, logits)
             logits = self._logits_buffer
@@ -248,28 +264,48 @@ class AI_model:
         pred = int(np.argmax(logits))
         probs = self.softmax(logits)
         probs_dict = {self.pred_dict[i]["desc"]: probs[i] for i in range(len(probs))}
-        
+
         # Get confidence of predicted class
         confidence = probs[pred]
-        
+
+        # --- Entry cooldown: bloqueia hits durante animação de abertura do círculo ---
+        current_time = time()
+
+        if pred == 0:
+            self._consecutive_none += 1
+            # Só confirma "sem skill check" após 2 frames consecutivos de classe 0
+            if self._consecutive_none >= 2:
+                self._skill_check_start_time = None
+        else:
+            self._consecutive_none = 0
+            # Inicia cooldown na PRIMEIRA detecção de classe hit (sem depender de _last_none_time)
+            if self.pred_dict[pred]["hit"] and self._skill_check_start_time is None:
+                self._skill_check_start_time = current_time
+
+        in_entry_cooldown = (
+            self._skill_check_start_time is not None and
+            (current_time - self._skill_check_start_time) < self._ENTRY_COOLDOWN
+        )
+        # -------------------------------------------------------------------------
+
         # Adicionar predição ao histórico
         self.prediction_history.append((pred, confidence))
-        
-        # Sistema de validação de predições consecutivas
+
+        # Lógica simples e direta - o que funcionava antes
         should_hit = False
-        
-        if pred != 0 and confidence >= confidence_threshold:
-            # Verificar se temos predições consecutivas similares
+
+        if pred != 0 and confidence >= confidence_threshold and not in_entry_cooldown:
+            # Validar apenas que a predição está acima do threshold
             if len(self.prediction_history) >= require_consecutive:
                 recent_preds = [p[0] for p in list(self.prediction_history)[-require_consecutive:]]
                 recent_confs = [p[1] for p in list(self.prediction_history)[-require_consecutive:]]
-                
-                # Todas as predições recentes devem ser iguais E acima do threshold
-                if (all(p == pred for p in recent_preds) and 
+
+                # Predições devem ser similares e com boa confiança
+                if (all(p == pred for p in recent_preds) and
                     all(c >= confidence_threshold for c in recent_confs)):
                     should_hit = self.pred_dict[pred]["hit"]
                     self.last_valid_pred = pred
-        
+
         return pred, self.pred_dict[pred]["desc"], probs_dict, should_hit, confidence
 
     def check_provider(self):

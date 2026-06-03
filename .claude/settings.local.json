@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"C:\\\\GIT\\\\dbd_autoSkillCheck\" -Recurse -Force)",
+      "Bash(Select-Object FullName)",
+      "Bash(rtk ls *)",
+      "Bash(grep -E \"\\\\.\\(txt|toml|yaml|yml|json|cfg\\)$\")",
+      "Bash(rtk git *)",
+      "Bash(rtk find *)",
+      "Bash(not exist *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\GIT\\\\dbd_autoSkillCheck\" -Recurse)",
+      "Bash(Select-Object -Property FullName, PSIsContainer)",
+      "Bash(Sort-Object FullName)",
+      "Bash(grep -E \"\\\\.\\(txt|toml|yaml|yml|cfg|ini|json\\)$\")",
+      "mcp__filesystem__directory_tree"
+    ]
+  }
+}
