@@ -18,35 +18,34 @@ try:
 except ImportError as e:
     print(e)
 
+try:
+    import dxcam
+    _DXCAM_AVAILABLE = True
+except ImportError:
+    _DXCAM_AVAILABLE = False
 
 # Cache monitor attributes globally for better performance
 _MONITOR_CACHE = None
 
 def get_monitor_attributes():
-    """Get monitor attributes with caching for better performance."""
     global _MONITOR_CACHE
-    
     if _MONITOR_CACHE is not None:
         return _MONITOR_CACHE
-    
     width, height = pyautogui_size()
-    object_size_h_ratio = 224 / 1080  # Modelo espera 224x224
-    object_size = int(object_size_h_ratio * height)
-
+    object_size = int(224 / 1080 * height)
     _MONITOR_CACHE = {
         "top": height // 2 - object_size // 2,
         "left": width // 2 - object_size // 2,
         "width": object_size,
-        "height": object_size
+        "height": object_size,
     }
     return _MONITOR_CACHE
 
 class AI_model:
     MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    # Opening animation is ~2-3 frames (33-50ms at 60fps). 50ms covers it without eating into the hit zone.
-    # 120ms was too long — it suppressed the entire hit zone on fast/perk-triggered skill checks.
-    _ENTRY_COOLDOWN = 0.05
+    # Sem cooldown de abertura: dispara imediatamente que IA detectar hit.
+    _ENTRY_COOLDOWN = 0.0
 
     pred_dict = {
         0: {"desc": "None", "hit": False},
@@ -67,22 +66,32 @@ class AI_model:
         self.use_gpu = use_gpu
         self.nb_cpu_threads = nb_cpu_threads
         self.monitor = get_monitor_attributes()
-        self.crop_size = 224  # Modelo espera 224x224
-        
+        self.crop_size = 224
         self.context = None
         self.engine = None
-        
-        # Pre-allocate arrays for faster processing
         self.prealloc_array = None
         self._logits_buffer = None
-        
-        # Sistema de validação simples - lógica original que funcionava
         self.prediction_history = deque(maxlen=2)
         self.last_valid_pred = 0
-
-        # Entry cooldown: evita hits falsos durante a animação de abertura do círculo
-        self._consecutive_none = 0   # frames consecutivos com pred==0
+        self._consecutive_none = 0
         self._skill_check_start_time = None
+        self._prev_great_prob = 0.0
+        self._great_rising_count = 0  # frames consecutivos com prob subindo
+
+        # dxcam: captura via DirectX — latência consistente ~2ms vs ~5-8ms do mss
+        self._dxcam_camera = None
+        if _DXCAM_AVAILABLE:
+            try:
+                m = self.monitor
+                region = (m["left"], m["top"], m["left"] + m["width"], m["top"] + m["height"])
+                self._dxcam_camera = dxcam.create(output_color="RGB", region=region)
+                self._dxcam_camera.start(target_fps=240, video_mode=True)
+                print("[INFO] dxcam ativo: captura DirectX 240fps")
+            except Exception as e:
+                print(f"[WARN] dxcam falhou, usando mss: {e}")
+                self._dxcam_camera = None
+        else:
+            print("[INFO] dxcam não instalado, usando mss")
 
         if model_path.endswith(".engine"):
             assert self.use_gpu, "TensorRT engine model requires GPU mode"
@@ -95,26 +104,59 @@ class AI_model:
         atexit.register(self.cleanup)
 
     def cleanup(self):
+        if self._dxcam_camera is not None:
+            try:
+                self._dxcam_camera.stop()
+            except Exception:
+                pass
         if getattr(self, 'is_tensorrt', False):
             del self.context
             del self.engine
             torch.cuda.empty_cache()
 
+    def grab_frame_numpy(self):
+        """Retorna (H, W, 3) uint8 RGB. None se dxcam não tiver frame novo ainda."""
+        if self._dxcam_camera is not None:
+            frame = self._dxcam_camera.get_latest_frame()
+            if frame is None:
+                return None
+            if frame.shape[0] != self.crop_size or frame.shape[1] != self.crop_size:
+                frame = np.array(
+                    Image.fromarray(frame).resize(
+                        (self.crop_size, self.crop_size), Image.Resampling.BILINEAR
+                    )
+                )
+            return frame
+        # fallback mss
+        if not hasattr(_mss_local, 'sct'):
+            _mss_local.sct = mss()
+        shot = _mss_local.sct.grab(self.monitor)
+        pil = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+        if pil.width != self.crop_size or pil.height != self.crop_size:
+            pil = pil.resize((self.crop_size, self.crop_size), Image.Resampling.BILINEAR)
+        return np.asarray(pil)
+
+    def numpy_to_model_input(self, frame_uint8):
+        """Converte numpy uint8 (H,W,3) RGB diretamente para tensor de entrada do modelo."""
+        if self.prealloc_array is None:
+            self.prealloc_array = np.zeros((1, 3, self.crop_size, self.crop_size), dtype=np.float32)
+        img = frame_uint8.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = (img - self.MEAN[:, None, None]) / self.STD[:, None, None]
+        self.prealloc_array[0] = img
+        return self.prealloc_array
+
+    # mantém compatibilidade com código legado (save_frames, run_single_pred, etc.)
     def grab_screenshot(self):
         if not hasattr(_mss_local, 'sct'):
             _mss_local.sct = mss()
         return _mss_local.sct.grab(self.monitor)
 
     def screenshot_to_pil(self, screenshot):
-        """Converte screenshot para PIL com otimizações de performance."""
-        # Conversão otimizada diretamente para RGB
-        pil_image = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-        
-        # Resize apenas se necessário, usando BILINEAR (mais rápido)
-        if pil_image.width != self.crop_size or pil_image.height != self.crop_size:
-            pil_image = pil_image.resize((self.crop_size, self.crop_size), Image.Resampling.BILINEAR)
-        
-        return pil_image
+        pil = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+        if pil.width != self.crop_size or pil.height != self.crop_size:
+            pil = pil.resize((self.crop_size, self.crop_size), Image.Resampling.BILINEAR)
+        return pil
 
     def pil_to_numpy(self, image_pil):
         """Converte PIL para numpy com performance otimizada e buffers pré-alocados."""
@@ -207,14 +249,16 @@ class AI_model:
 
         return inputs, outputs, bindings
 
-    def predict(self, image, confidence_threshold=0.65, require_consecutive=1):
+    # Índices das classes "great" no pred_dict
+    _GREAT_INDICES = (1, 4, 6, 8)
+
+    def predict(self, image, confidence_threshold=0.65, require_consecutive=1, early_threshold=0.0):
         """
-        Predição otimizada com validação de predições consecutivas.
-        
-        Args:
-            image: Imagem PIL ou numpy array
-            confidence_threshold: Limiar de confiança mínimo (0.65-0.75 recomendado para responsividade)
-            require_consecutive: Número de predições consecutivas necessárias (1=rápido, 2=conservador)
+        Predição com detecção antecipada opcional.
+
+        early_threshold: se > 0, dispara quando a probabilidade bruta de qualquer classe
+                         great superar esse valor, mesmo antes do confidence_threshold.
+                         Captura o ponteiro ENTRANDO na zona ótima, não no meio/saindo.
         """
         if isinstance(image, np.ndarray):
             img_np = image
@@ -245,12 +289,6 @@ class AI_model:
             torch.cuda.synchronize()
             logits = np.squeeze(self.outputs[0]['host'])
         else:
-            if self.input_dtype == "tensor(float)":
-                img_np = img_np.astype(np.float32)
-            elif self.input_dtype == "tensor(float16)":
-                img_np = img_np.astype(np.float16)
-
-            # Only convert dtype when necessary — prealloc_array is already float32
             if self.input_dtype == "tensor(float16)":
                 img_np = img_np.astype(np.float16)
 
@@ -273,9 +311,10 @@ class AI_model:
 
         if pred == 0:
             self._consecutive_none += 1
-            # Só confirma "sem skill check" após 2 frames consecutivos de classe 0
             if self._consecutive_none >= 2:
                 self._skill_check_start_time = None
+                self._prev_great_prob = 0.0
+                self._great_rising_count = 0
         else:
             self._consecutive_none = 0
             # Inicia cooldown na PRIMEIRA detecção de classe hit (sem depender de _last_none_time)
@@ -295,16 +334,30 @@ class AI_model:
         should_hit = False
 
         if pred != 0 and confidence >= confidence_threshold and not in_entry_cooldown:
-            # Validar apenas que a predição está acima do threshold
             if len(self.prediction_history) >= require_consecutive:
                 recent_preds = [p[0] for p in list(self.prediction_history)[-require_consecutive:]]
                 recent_confs = [p[1] for p in list(self.prediction_history)[-require_consecutive:]]
 
-                # Predições devem ser similares e com boa confiança
                 if (all(p == pred for p in recent_preds) and
                     all(c >= confidence_threshold for c in recent_confs)):
                     should_hit = self.pred_dict[pred]["hit"]
                     self.last_valid_pred = pred
+
+        # Disparo antecipado: rastreia quantos frames consecutivos P(great) está subindo.
+        # Dispara quando: prob >= early_threshold E subindo por 2+ frames consecutivos.
+        # 2 frames de confirmação filtram ruído sem perder o timing de entrada na zona.
+        max_great_prob = max(probs[i] for i in self._GREAT_INDICES)
+
+        if max_great_prob > self._prev_great_prob + 0.004:
+            self._great_rising_count += 1
+        else:
+            self._great_rising_count = 0
+
+        if not should_hit and early_threshold > 0 and not in_entry_cooldown:
+            if max_great_prob >= early_threshold and self._great_rising_count >= 1:
+                should_hit = True
+
+        self._prev_great_prob = max_great_prob
 
         return pred, self.pred_dict[pred]["desc"], probs_dict, should_hit, confidence
 
