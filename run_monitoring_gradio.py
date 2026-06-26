@@ -147,8 +147,10 @@ def monitor(ai_model_path, device, debug_option,
                 non_sc_streak += 1
                 geo_should_hit = False
 
-            # Geo dispara cedo via predição de velocidade; IA é fallback no warm-up.
-            should_hit = geo_should_hit or ai_should_hit
+            # Geo dispara cedo via predição de velocidade; IA só dispara como fallback
+            # se o ponteiro já está em movimento (geo.needle_is_moving), bloqueando
+            # falsos positivos durante a animação de abertura do círculo.
+            should_hit = geo_should_hit or (ai_should_hit and geo.needle_is_moving())
 
             if display_live and (current_time - last_update) > 1.0:
                 yield skip(), PILImage.fromarray(frame), skip()
